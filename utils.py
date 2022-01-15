@@ -13,6 +13,7 @@ from collections import OrderedDict
 import glob
 from PIL import Image
 import pickle
+import scipy.io as sio
 
 def _weights_init(m):
     if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -1152,3 +1153,218 @@ class LossLine():
             out.append(item)
         return sep.join(out)
         
+def get_aligned_representations(representations, order):
+    for epoch in range(len(representations)):
+        for layer in range(len(representations[0])):
+            # representations[epoch][layer] = representations[epoch][layer][np.argsort(order[epoch]), :]
+            representations[epoch][layer] = representations[epoch][layer].cpu().numpy()[np.argsort(order[epoch]), :]
+
+    return representations
+
+from multiprocessing import cpu_count
+from joblib import Parallel, delayed
+
+import warnings
+import numpy as np
+from pdb import set_trace as st
+# import numba
+
+
+NUM_CORES = cpu_count()
+warnings.filterwarnings("ignore")
+
+
+# @numba.jit
+def entropy(probs):
+    return -np.sum(probs * np.ma.log2(probs))
+
+
+# @numba.jit
+def joint_entropy(unique_inverse_x, unique_inverse_y, bins_x, bins_y):
+
+    joint_distribution = np.zeros((bins_x, bins_y))
+    np.add.at(joint_distribution, (unique_inverse_x, unique_inverse_y), 1)
+    joint_distribution /= np.sum(joint_distribution)
+
+    return entropy(joint_distribution)
+
+
+# @numba.jit
+def layer_information(layer_output, bins, py, px, unique_inverse_x, unique_inverse_y):
+    ws_epoch_layer_bins = bins[np.digitize(layer_output, bins) - 1]
+    ws_epoch_layer_bins = ws_epoch_layer_bins.reshape(len(layer_output), -1)
+
+    unique_t, unique_inverse_t, unique_counts_t = np.unique(
+        ws_epoch_layer_bins, axis=0,
+        return_index=False, return_inverse=True, return_counts=True
+    )
+
+    pt = unique_counts_t / np.sum(unique_counts_t)
+
+    # # I(X, Y) = H(Y) - H(Y|X)
+    # # H(Y|X) = H(X, Y) - H(X)
+
+    x_entropy = entropy(px)
+    y_entropy = entropy(py)
+    t_entropy = entropy(pt)
+
+    x_t_joint_entropy = joint_entropy(unique_inverse_x, unique_inverse_t, px.shape[0], layer_output.shape[0])
+    y_t_joint_entropy = joint_entropy(unique_inverse_y, unique_inverse_t, py.shape[0], layer_output.shape[0])
+
+    return {
+        'local_IXT': t_entropy + x_entropy - x_t_joint_entropy,
+        'local_ITY': y_entropy + t_entropy - y_t_joint_entropy
+    }
+
+
+# @numba.jit
+def calc_information_for_epoch(epoch_number, ws_epoch, bins, unique_inverse_x,
+                               unique_inverse_y, pxs, pys):
+    """Calculate the information for all the layers for specific epoch"""
+    information_epoch = []
+
+    for i in range(len(ws_epoch)):
+        information_epoch_layer = layer_information(
+            layer_output=ws_epoch[i],
+            bins=bins,
+            unique_inverse_x=unique_inverse_x,
+            unique_inverse_y=unique_inverse_y,
+            px=pxs, py=pys
+        )
+        information_epoch.append(information_epoch_layer)
+    information_epoch = np.array(information_epoch)
+
+    # print('Processed epoch {}'.format(epoch_number))
+
+    return information_epoch
+
+
+# @numba.jit
+def extract_probs(label, x):
+    """calculate the probabilities of the given data and labels p(x), p(y) and (y|x)"""
+    pys = np.sum(label, axis=0) / float(label.shape[0])
+
+    unique_x, unique_x_indices, unique_inverse_x, unique_x_counts = np.unique(
+        x, axis=0,
+        return_index=True, return_inverse=True, return_counts=True
+    )
+
+    pxs = unique_x_counts / np.sum(unique_x_counts)
+
+    unique_array_y, unique_y_indices, unique_inverse_y, unique_y_counts = np.unique(
+        label, axis=0,
+        return_index=True, return_inverse=True, return_counts=True
+    )
+    return pys, None, unique_x, unique_inverse_x, unique_inverse_y, pxs
+
+
+def get_information(ws, x, label, num_of_bins, every_n=1,
+                    return_matrices=False):
+    
+    """
+    Calculate the information for the network for all the epochs and all the layers
+
+    ws.shape =  [n_epoch, n_layers, n_params]
+    ws --- outputs of all layers for all epochs
+    """
+
+    # print('Start calculating the information...')
+
+    bins = np.linspace(-1, 1, num_of_bins)
+    label = np.array(label).astype(np.float)
+    pys, _, unique_x, unique_inverse_x, unique_inverse_y, pxs = extract_probs(label, x)
+
+    with Parallel(n_jobs=NUM_CORES, prefer='threads') as parallel:
+        information_total = parallel(
+            delayed(calc_information_for_epoch)(
+                i, epoch_output, bins, unique_inverse_x, unique_inverse_y, pxs, pys
+            ) for i, epoch_output in enumerate(ws) if i % every_n == 0
+        )
+
+    if not return_matrices:
+        return information_total
+
+    ixt_matrix = np.zeros((len(information_total), len(ws[0])))
+    ity_matrix = np.zeros((len(information_total), len(ws[0])))
+
+    for epoch, layer_info in enumerate(information_total):
+        for layer, info in enumerate(layer_info):
+            ixt_matrix[epoch][layer] = info['local_IXT']
+            ity_matrix[epoch][layer] = info['local_ITY']
+
+    return ixt_matrix, ity_matrix
+
+def load_tishby_toy_dataset(filename, assign_random_labels=False, seed=42):
+    np.random.seed(seed)
+    
+    data = sio.loadmat(filename)
+    F = data['F']
+    
+    if assign_random_labels:
+        y = np.random.randint(0, 2)
+    else:
+        y = data['y'].T
+    
+    return F, y
+
+def plot_information_plane(IXT_array, ITY_array, num_epochs, every_n, args, logger):
+    assert len(IXT_array) == len(ITY_array)
+
+    max_index = len(IXT_array)
+
+    plt.figure(figsize=(15, 9))
+    plt.title(args.project_name)
+    plt.xlabel('$I(X;T)$')
+    plt.ylabel('$I(T;Y)$')
+
+    cmap = plt.get_cmap('gnuplot')
+    colors = [cmap(i) for i in np.linspace(0, 1, num_epochs + 1)]
+
+    for i in range(0, max_index):
+        IXT = IXT_array[i, :]
+        ITY = ITY_array[i, :]
+        plt.plot(IXT, ITY, marker='o', markersize=args.marksize, markeredgewidth=0.04,
+                 linestyle=None, linewidth=1, color=colors[i * every_n], zorder=10)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=1))
+    sm._A = []
+    cbar = plt.colorbar(sm, ticks=[])
+    cbar.set_label('Num epochs')
+    cbar.ax.text(0.5, -0.01, 0, transform=cbar.ax.transAxes, va='top', ha='center')
+    cbar.ax.text(0.5, 1.0, str(num_epochs), transform=cbar.ax.transAxes, va='bottom', ha='center')
+    
+    IP_path = logger.gen_img_path + '/' + args.project_name + '_epoch_wise.jpg'
+    plt.savefig(IP_path)
+
+    plt.show()
+
+def plot_information_plane2(IXT_array, ITY_array, num_epochs, every_n, args, logger):
+    assert len(IXT_array) == len(ITY_array)
+
+    max_index = np.shape(IXT_array)[1]
+
+    plt.figure(figsize=(15, 9))
+    plt.title(args.project_name)
+    plt.xlabel('$I(X;T)$')
+    plt.ylabel('$I(T;Y)$')
+
+    cmap = plt.get_cmap('gnuplot')
+    colors = [cmap(i) for i in np.linspace(0, 1, max_index + 1)]
+
+    for i in range(0, max_index):
+        IXT = IXT_array[:, i]
+        ITY = ITY_array[:, i]
+        plt.plot(IXT, ITY, marker='o', markersize=args.marksize, markeredgewidth=0.04,
+                 linestyle=None, linewidth=1, color=colors[i], zorder=10)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=1))
+    sm._A = []
+    cbar = plt.colorbar(sm, ticks=[])
+    cbar.set_label('Num layers')
+    cbar.ax.text(0.5, -0.01, 0, transform=cbar.ax.transAxes, va='top', ha='center')
+    cbar.ax.text(0.5, 1.0, str(max_index), transform=cbar.ax.transAxes, va='bottom', ha='center')
+    
+    IP_path = logger.gen_img_path + '/' + args.project_name + '_layer_wise.jpg'
+    plt.savefig(IP_path)
+
+    plt.show()
